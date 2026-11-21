@@ -1,0 +1,25 @@
+[Desktop Entry]
+Name=Zen Browser
+Comment=A fast, private and secure web browser built to improve your day-to-day experience
+Exec=/usr/bin/zen %u
+Icon=zen
+Type=Application
+Terminal=false
+StartupNotify=true
+StartupWMClass=zen
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;application/xml;application/pdf;x-scheme-handler/http;x-scheme-handler/https;
+Actions=new-window;new-private-window;profile-manager-window;
+Keywords=Internet;WWW;Browser;Web;Explorer;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=/usr/bin/zen --new-window %u
+
+[Desktop Action new-private-window]
+Name=New Private Window
+Exec=/usr/bin/zen --private-window
+
+[Desktop Action profile-manager-window]
+Name=Open the Profile Manager
+Exec=/usr/bin/zen --ProfileManager

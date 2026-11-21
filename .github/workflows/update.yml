@@ -1,0 +1,144 @@
+name: Package Zen and publish APT repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and republish even when the upstream tag is unchanged
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Twice daily is enough for browser updates; exact execution can be delayed by GitHub.
+    - cron: '17 5,17 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zen-browser-deb-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APT_KEY_FINGERPRINT: 57CDF649F0C36D83327DCA3444F44AB0500F9C3F
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@v6
+
+      - name: Check latest upstream release
+        id: upstream
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api repos/zen-browser/desktop/releases/latest --jq .tag_name)
+          current=$(cat state/latest-release)
+          changed=true
+          if [[ $tag == "$current" && $FORCE != true ]]; then
+              changed=false
+          fi
+          printf 'Upstream %s; packaged %s; changed=%s\n' "$tag" "$current" "$changed"
+          printf 'TAG=%s\n' "$tag" >> "$GITHUB_ENV"
+          printf 'changed=%s\n' "$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Install packaging tools
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils dpkg-dev gnupg jq xz-utils
+
+      - name: Download and verify official Zen binary
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          work=$RUNNER_TEMP/zen-upstream
+          install -d "$work"
+          asset=$(gh api repos/zen-browser/desktop/releases/latest \
+              --jq '.assets[] | select(.name == "zen.linux-x86_64.tar.xz")')
+          url=$(jq -r .browser_download_url <<< "$asset")
+          digest=$(jq -r .digest <<< "$asset")
+          [[ $url == https://github.com/zen-browser/desktop/releases/download/* ]]
+          [[ $digest == sha256:* ]]
+          curl --fail --location --retry 5 --output "$work/zen.tar.xz" "$url"
+          printf '%s  %s\n' "${digest#sha256:}" "$work/zen.tar.xz" | sha256sum --check -
+
+      - name: Build native Debian package
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          scripts/build-deb.sh "$TAG" "$RUNNER_TEMP/zen-upstream/zen.tar.xz" \
+              "$RUNNER_TEMP/package"
+
+      - name: Test package on Debian 13
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$RUNNER_TEMP/package:/packages:ro" debian:trixie \
+              bash -euc '
+                  export DEBIAN_FRONTEND=noninteractive
+                  apt-get update
+                  apt-get install -y --no-install-recommends /packages/*.deb
+                  zen --version
+                  test -f /usr/share/applications/zen.desktop
+                  test -f /opt/zen/distribution/policies.json
+                  export LD_LIBRARY_PATH=/opt/zen${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+                  ! ldd /opt/zen/zen-bin | grep "not found"
+                  ! ldd /opt/zen/libxul.so | grep "not found"
+              '
+
+      - name: Import APT signing key
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n $APT_GPG_PRIVATE_KEY ]]
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Build signed flat APT metadata
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          scripts/publish-apt.sh "$RUNNER_TEMP/package/zen-browser_${TAG}-1_amd64.deb" \
+              "$RUNNER_TEMP/apt" "$APT_KEY_FINGERPRINT"
+
+      - name: Publish rolling APT release
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          if ! gh release view apt --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release create apt --repo "$GITHUB_REPOSITORY" \
+                  --title 'Signed APT repository' \
+                  --notes 'Rolling flat APT repository. Packages and signed metadata are release assets; no Git file-size limit applies.'
+          fi
+          # Publish the package first. Metadata switches clients to it afterwards.
+          gh release upload apt --repo "$GITHUB_REPOSITORY" --clobber \
+              "$RUNNER_TEMP/apt/zen-browser_${TAG}-1_amd64.deb"
+          cp zen-browser-deb.gpg "$RUNNER_TEMP/apt/"
+          gh release upload apt --repo "$GITHUB_REPOSITORY" --clobber \
+              "$RUNNER_TEMP/apt/Packages" \
+              "$RUNNER_TEMP/apt/Packages.gz" \
+              "$RUNNER_TEMP/apt/Release" \
+              "$RUNNER_TEMP/apt/Release.gpg" \
+              "$RUNNER_TEMP/apt/InRelease" \
+              "$RUNNER_TEMP/apt/zen-browser-deb.gpg"
+
+      - name: Record packaged upstream release
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAG" > state/latest-release
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add state/latest-release
+          git commit -m "chore: package Zen $TAG"
+          for attempt in 1 2 3; do
+              if git push; then
+                  exit 0
+              fi
+              git pull --rebase origin main
+          done
+          exit 1
